@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import MinMaxScaler
+import optuna
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# --- 1. Load Data ---
+try:
+    train_df = pd.read_csv('dataset/train.csv')
+    test_df = pd.read_csv('dataset/test.csv')
+    sample_submission_df = pd.read_csv('dataset/sample_solution.csv')
+except FileNotFoundError:
+    print("Error: Ensure 'train.csv', 'test.csv', and 'sample_solution.csv' are in 'dataset/'.")
+    exit()
+
+# --- 2. Preprocessing: Tighter Outlier Clipping and Target Transformation ---
+prop_cols = [col for col in train_df.columns if 'Property' in col and 'Blend' not in col]
+for col in prop_cols:
+    train_df[col] = train_df[col].clip(lower=train_df[col].quantile(0.02), upper=train_df[col].quantile(0.98))
+    test_df[col] = test_df[col].clip(lower=train_df[col].quantile(0.02), upper=train_df[col].quantile(0.98))
+
+target_columns = [f'BlendProperty{i}' for i in range(1, 11)]
+for col in target_columns:
+    train_df[col] = train_df[col].clip(lower=train_df[col].quantile(0.02), upper=train_df[col].quantile(0.98))
+    if (train_df[col] > 0).all() and train_df[col].skew() > 1:
+        train_df[f'{col}_log'] = np.log1p(train_df[col])
+
+y_train = train_df[[f'{col}_log' if (train_df[col] > 0).all() and train_df[col].skew() > 1 else col for col in target_columns]]
+original_feature_columns = [col for col in train_df.columns if col not in ['ID'] + target_columns + [f'{col}_log' for col in target_columns]]
+test_ids = test_df['ID']
+
+# --- 3. Feature Engineering ---
+def create_features(df, original_feats):
+    df_processed = df.drop(columns=['ID'], errors='ignore').copy()
+    df_features = df_processed[original_feats].copy()
+    blend_cols = [f'Component{i}_vol' for i in range(1, 6)]
+    
+    for col in blend_cols:
+        if col in df_features.columns:
+            df_features[col] = df_features[col].astype(float)
+    
+    # 1. Weighted Averages
+    for prop_num in range(1, 11):
+        weighted_avg_col = f'BlendProperty{prop_num}_WeightedAvg'
+        df_features[weighted_avg_col] = 0.0
+        for comp_num in range(1, 6):
+            vol_col = f'Component{comp_num}_vol'
+            prop_col = f'Component{comp_num}_Property{prop_num}'
+            if vol_col in df_processed.columns and prop_col in df_processed.columns:
+                df_features[weighted_avg_col] += (df_processed[vol_col] / 100.0) * df_processed[prop_col]
+    
+    # 2. Selective Volume-Property Interactions
+    for comp_num in range(1, 3):
+        vol_col = f'Component{comp_num}_vol'
+        for prop_num in range(1, 11):
+            prop_col = f'Component{comp_num}_Property{prop_num}'
+            if vol_col in df_processed.columns and prop_col in df_processed.columns:
+                df_features[f'{vol_col}_x_{prop_col}'] = df_processed[vol_col] * df_processed[prop_col]
+    
+    # 3. Statistical Aggregations
+    for prop_num in range(1, 11):
+        props_for_agg = [f'Component{comp_num}_Property{prop_num}' for comp_num in range(1, 6)]
+        existing_props = [p for p in props_for_agg if p in df_processed.columns]
+        if existing_props:
+            df_features[f'Property{prop_num}_mean'] = df_processed[existing_props].mean(axis=1)
+    
+    # 4. Target-Guided Features (20 bins)
+    global mean_target_dict
+    mean_target_dict = {}
+    if 'Component1_vol' in df_processed.columns:
+        for col in target_columns:
+            for comp_num in range(1, 6):
+                vol_col = f'Component{comp_num}_vol'
+                if vol_col in df_processed.columns:
+                    bins = pd.qcut(train_df[vol_col], q=20, duplicates='drop') if 'train' in df.__class__.__name__ else pd.cut(df_processed[vol_col], bins=20)
+                    if 'train' in df.__class__.__name__:
+                        mean_target_dict[(col, vol_col)] = train_df.groupby(bins)[col].mean()
+                    df_features[f'{vol_col}_mean_{col}'] = df_processed[vol_col].map(mean_target_dict.get((col, vol_col), {}))
+    
+    # 5. Property-Specific Ratios
+    for prop_num in range(1, 11):
+        for comp_num1 in range(1, 3):
+            for comp_num2 in range(comp_num1 + 1, 4):
+                prop_col1 = f'Component{comp_num1}_Property{prop_num}'
+                prop_col2 = f'Component{comp_num2}_Property{prop_num}'
+                if prop_col1 in df_processed.columns and prop_col2 in df_processed.columns:
+                    df_features[f'Prop{prop_num}_Comp{comp_num1}_div_Comp{comp_num2}'] = df_processed[prop_col1] / (df_processed[prop_col2] + 1e-6)
+    
+    # 6. Polynomial Features for High-MAPE Targets
+    for comp_num in range(1, 3):
+        vol_col = f'Component{comp_num}_vol'
+        if vol_col in df_processed.columns:
+            df_features[f'{vol_col}_squared'] = df_processed[vol_col] ** 2
+    
+    # 7. Cross-Component Interactions
+    for prop_num in range(1, 5):  # Focus on high-MAPE targets
+        for comp_num1 in range(1, 3):
+            for comp_num2 in range(comp_num1 + 1, 4):
+                prop_col1 = f'Component{comp_num1}_Property{prop_num}'
+                prop_col2 = f'Component{comp_num2}_Property{prop_num}'
+                if prop_col1 in df_processed.columns and prop_col2 in df_processed.columns:
+                    df_features[f'Prop{prop_num}_Comp{comp_num1}_x_Comp{comp_num2}'] = df_processed[prop_col1] * df_processed[prop_col2]
+    
+    df_features = df_features.fillna(0)
+    return df_features
+
+# Apply feature engineering
+print("\nPerforming Feature Engineering...")
+X_train_fe = create_features(train_df, original_feature_columns)
+X_test_fe = create_features(test_df, original_feature_columns)
+
+# Align columns
+train_cols = X_train_fe.columns
+test_cols = X_test_fe.columns
+missing_in_test = set(train_cols) - set(test_cols)
+for c in missing_in_test:
+    X_test_fe[c] = 0
+missing_in_train = set(test_cols) - set(train_cols)
+for c in missing_in_train:
+    X_train_fe[c] = 0
+X_test_fe = X_test_fe[train_cols]
+
+# Per-Target Feature Selection
+feature_sets = {}
+for i, col in enumerate(target_columns):
+    initial_lgb = lgb.LGBMRegressor(n_estimators=607, learning_rate=0.01825, num_leaves=31, feature_fraction=0.9486, bagging_fraction=0.8100, lambda_l1=1.5837, lambda_l2=7.7822, min_child_samples=20, device='cpu', n_jobs=-1)
+    initial_lgb.fit(X_train_fe, y_train.iloc[:, i])
+    importances = pd.Series(initial_lgb.feature_importances_, index=X_train_fe.columns)
+    feature_sets[col] = importances.nlargest(40).index  # Reduced to 40 features
+
+# --- 4. Target-Specific Modeling with Optuna ---
+def objective(trial, X, y, target_idx):
+    lgb_params = {
+        'objective': 'regression_l1',
+        'metric': 'mae',
+        'n_estimators': trial.suggest_int('n_estimators', 550, 650),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.03, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 25, 35),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.85, 1.0),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.75, 0.9),
+        'lambda_l1': trial.suggest_float('lambda_l1', 0.5, 2.0),
+        'lambda_l2': trial.suggest_float('lambda_l2', 6.0, 9.0),
+        'min_child_samples': trial.suggest_int('min_child_samples', 20, 50),
+        'device': 'cpu',
+        'n_jobs': -1,
+        'seed': 42
+    }
+    xgb_params = {
+        'objective': 'reg:absoluteerror',
+        'n_estimators': trial.suggest_int('n_estimators', 550, 650),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.03, log=True),
+        'max_depth': trial.suggest_int('max_depth', 3, 6),
+        'subsample': trial.suggest_float('subsample', 0.75, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.75, 1.0),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 2.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0.5, 2.0),
+        'random_state': 42,
+        'n_jobs': -1
+    }
+    kf = KFold(n_splits=7, shuffle=True, random_state=42)
+    mape_scores = []
+    for train_idx, val_idx in kf.split(X):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        lgb_model = lgb.LGBMRegressor(**lgb_params, early_stopping_rounds=300 if target_idx in [0, 1, 2, 3] else 50)
+        xgb_model = xgb.XGBRegressor(**xgb_params, early_stopping_rounds=300 if target_idx in [0, 1, 2, 3] else 50)
+        lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric='mae', callbacks=None)
+        xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        lgb_pred = lgb_model.predict(X_val)
+        xgb_pred = xgb_model.predict(X_val)
+        weights = [0.75, 0.25] if target_idx in [0, 1, 2, 3] else [0.65, 0.35]
+        blend_pred = weights[0] * lgb_pred + weights[1] * xgb_pred
+        mape = mean_absolute_percentage_error(np.expm1(y_val) if (y_train.iloc[:, target_idx] > 0).all() and y_train.iloc[:, target_idx].skew() > 1 else y_val, np.expm1(blend_pred) if (y_train.iloc[:, target_idx] > 0).all() and y_train.iloc[:, target_idx].skew() > 1 else blend_pred)
+        mape_scores.append(mape)
+    return np.mean(mape_scores)
+
+# Train target-specific models
+print("\nTuning Models for Each Target...")
+models = {col: {} for col in target_columns}
+test_preds = {col: [] for col in target_columns}
+test_preds_xgb = {col: [] for col in target_columns}
+oof_preds = np.zeros(y_train.shape)
+kf = KFold(n_splits=7, shuffle=True, random_state=42)
+per_target_mape = []
+best_mape_history = {col: float('inf') for col in target_columns}
+
+def callback(study, trial):
+    for col in target_columns:
+        if trial.value < best_mape_history[col]:
+            best_mape_history[col] = trial.value
+        if trial.number > 15 and best_mape_history[col] == min([t.value for t in study.trials if t.value is not None][:trial.number]):
+            study.stop()
+
+for i, col in enumerate(target_columns):
+    print(f"\nTuning for {col}...")
+    X_train_target = X_train_fe[feature_sets[col]]
+    X_test_target = X_test_fe[feature_sets[col]]
+    scaler = MinMaxScaler()
+    X_train_target = pd.DataFrame(scaler.fit_transform(X_train_target), columns=X_train_target.columns, index=X_train_target.index)
+    X_test_target = pd.DataFrame(scaler.transform(X_test_target), columns=X_test_target.columns, index=X_test_target.index)
+    
+    study = optuna.create_study(direction='minimize')
+    study.optimize(lambda trial: objective(trial, X_train_target, y_train.iloc[:, i], i), n_trials=50, callbacks=[callback])
+    lgb_params = {k: v for k, v in study.best_params.items() if k in ['n_estimators', 'learning_rate', 'num_leaves', 'feature_fraction', 'bagging_fraction', 'lambda_l1', 'lambda_l2', 'min_child_samples']}
+    lgb_params.update({'objective': 'regression_l1', 'metric': 'mae', 'device': 'cpu', 'n_jobs': -1, 'seed': 42, 'early_stopping_rounds': 300 if i in [0, 1, 2, 3] else 50})
+    xgb_params = {k: v for k, v in study.best_params.items() if k in ['n_estimators', 'learning_rate', 'max_depth', 'subsample', 'colsample_bytree', 'reg_lambda', 'reg_alpha']}
+    xgb_params.update({'objective': 'reg:absoluteerror', 'random_state': 42, 'n_jobs': -1, 'early_stopping_rounds': 300 if i in [0, 1, 2, 3] else 50})
+    
+    for fold, (train_idx, val_idx) in kf.split(X_train_target):
+        X_tr, X_val = X_train_target.iloc[train_idx], X_train_target.iloc[val_idx]
+        y_tr, y_val = y_train.iloc[:, i].iloc[train_idx], y_train.iloc[:, i].iloc[val_idx]
+        lgb_model = lgb.LGBMRegressor(**lgb_params)
+        xgb_model = xgb.XGBRegressor(**xgb_params)
+        lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric='mae', callbacks=None)
+        xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        weights = [0.75, 0.25] if i in [0, 1, 2, 3] else [0.65, 0.35]
+        blend_pred = weights[0] * lgb_model.predict(X_val) + weights[1] * xgb_model.predict(X_val)
+        oof_preds[val_idx, i] = blend_pred
+        test_pred = weights[0] * lgb_model.predict(X_test_target) + (1 - weights[0]) * xgb_model.predict(X_test_target)
+        test_preds[col].append(np.expm1(test_pred) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else test_pred)
+        test_preds_xgb[col].append(xgb_model.predict(X_test_target))
+    
+    # Per-target MAPE
+    target_mape = np.mean([mean_absolute_percentage_error(np.expm1(y_train.iloc[val_idx, i]) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else y_train.iloc[val_idx, i], np.expm1(oof_preds[val_idx, i]) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else oof_preds[val_idx, i]) for _, val_idx in kf.split(X_train_target)])
+    per_target_mape.append((col, target_mape))
+    print(f"{col} MAPE: {target_mape:.4f}")
+
+# Optimize blending weights
+print("\nOptimizing blending weights...")
+best_weights = []
+for i, col in enumerate(target_columns):
+    best_mape = np.inf
+    best_w = 0.7
+    for w in np.linspace(0.3, 1.0, 20):
+        blend_pred = w * oof_preds[:, i] + (1 - w) * np.mean([xgb_model.predict(X_train_fe[feature_sets[col]]) for xgb_model in [xgb.XGBRegressor(**xgb_params).fit(X_train_fe[feature_sets[col]], y_train.iloc[:, i]) for _ in range(1)]], axis=0)
+        mape = mean_absolute_percentage_error(np.expm1(y_train.iloc[:, i]) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else y_train.iloc[:, i], np.expm1(blend_pred) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else blend_pred)
+        if mape < best_mape:
+            best_mape = mape
+            best_w = w
+    best_weights.append(best_w)
+    print(f"Best weight for {col}: {best_w:.2f}, MAPE: {best_mape:.4f}")
+
+# Evaluate CV MAPE
+fold_mape_scores = [np.mean([mean_absolute_percentage_error(np.expm1(y_train.iloc[val_idx, i]) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else y_train.iloc[val_idx, i], np.expm1(oof_preds[val_idx, i]) if (y_train.iloc[:, i] > 0).all() and y_train.iloc[:, i].skew() > 1 else oof_preds[val_idx, i]) for i in range(len(target_columns))]) for _, val_idx in kf.split(X_train_fe)]
+overall_cv_mape = np.mean(fold_mape_scores)
+print(f"\nOverall CV MAPE: {overall_cv_mape:.4f}")
+print("Per-target MAPE:", [(col, mape) for col, mape in per_target_mape])
+
+# --- 5. Final Predictions and Submission ---
+final_test_predictions = np.zeros((X_test_fe.shape[0], len(target_columns)))
+for i, col in enumerate(target_columns):
+    X_test_target = X_test_fe[feature_sets[col]]
+    X_test_target = pd.DataFrame(scaler.transform(X_test_target), columns=X_test_target.columns, index=X_test_target.index)
+    final_test_predictions[:, i] = np.mean([best_weights[i] * lgb_pred + (1 - best_weights[i]) * xgb_pred for lgb_pred, xgb_pred in zip(test_preds[col], test_preds_xgb[col])], axis=0)
+
+predictions_df = pd.DataFrame(final_test_predictions, columns=target_columns)
+submission_df = pd.DataFrame({'ID': test_ids})
+submission_df = pd.concat([submission_df, predictions_df], axis=1)
+submission_df = submission_df[['ID'] + target_columns]
+
+submission_file_name = 'submission_cpu_50_trials_fixed.csv'
+submission_df.to_csv(submission_file_name, index=False)
+
+print(f"\nSubmission file '{submission_file_name}' created successfully!")
+print("First 5 rows:")
+print(submission_df.head())
+
+reference_cost_public = 2.72
+estimated_score = 100 * max(0, 1 - overall_cv_mape / reference_cost_public)
+print(f"Estimated Public Leaderboard Score: {estimated_score:.2f}")

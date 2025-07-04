@@ -1,3 +1,4 @@
+We are trying to predict 10 blend properties (multi-output regression) from blend composition and component properties using machine learning models.
 
 ### 1. Overall Approach
 
@@ -27,4 +28,3 @@ Solution developed in Python 3.x, using:
 
 My submission includes:
 * `main.py`: The Python script that performs the solution.
-```
