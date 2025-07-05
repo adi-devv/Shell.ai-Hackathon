@@ -1,241 +1,223 @@
-import pandas as pd
 import numpy as np
-import lightgbm as lgb
-import xgboost as xgb
-from sklearn.model_selection import KFold
+import pandas as pd
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import StandardScaler, PowerTransformer
 from sklearn.metrics import mean_absolute_percentage_error
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler
-import optuna
+from sklearn.ensemble import StackingRegressor, VotingRegressor
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.feature_selection import SelectFromModel, RFE
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import DotProduct, WhiteKernel
+from sklearn.decomposition import PCA
 import warnings
-
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
-# --- 1. Load Data ---
-try:
-    train_df = pd.read_csv('dataset/train.csv')
-    test_df = pd.read_csv('dataset/test.csv')
-    sample_submission_df = pd.read_csv('dataset/sample_solution.csv')
-except FileNotFoundError:
-    print("Error: Ensure 'train.csv', 'test.csv', and 'sample_solution.csv' are in the 'dataset/' directory.")
-    exit()
-
-print("Train data shape:", train_df.shape)
-print("Test data shape:", test_df.shape)
-
-# --- 2. Define Features and Targets ---
-target_columns = [f'BlendProperty{i}' for i in range(1, 11)]
-original_feature_columns = [col for col in train_df.columns if col not in ['ID'] + target_columns]
-test_ids = test_df['ID']
-
-# --- 3. Enhanced Feature Engineering ---
-def create_features(df, is_train_df=True):
-    df_processed = df.drop(columns=['ID'], errors='ignore').copy()
+# Enhanced Feature Engineering
+class AdvancedFeatureEngineer(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.important_props = [1, 2, 3, 5, 7]  # Identified as important
     
-    blend_cols = [f'Component{i}_vol' for i in range(1, 6)]
-    component_prop_cols_map = {comp_num: [f'Component{comp_num}_Property{prop_num}' for prop_num in range(1, 11)] for comp_num in range(1, 6)}
+    def fit(self, X, y=None):
+        return self
     
-    # Add original features
-    features_to_add_back = [col for col in df.columns if col in original_feature_columns]
-    df_features = df_processed[features_to_add_back].copy()
+    def transform(self, X):
+        X = X.copy()
+        components = ['Component1', 'Component2', 'Component3', 'Component4', 'Component5']
+        
+        # Feature storage for efficient concatenation
+        new_features = {}
+        
+        # 1. Basic weighted features
+        for prop in range(1, 11):
+            weighted_sum = sum(X[f'{comp}_fraction'] * X[f'{comp}_Property{prop}'] for comp in components)
+            new_features[f'WeightedAvg_Property{prop}'] = weighted_sum
+            
+            props = np.array([X[f'{comp}_Property{prop}'] for comp in components]).T
+            new_features[f'StdDev_Property{prop}'] = np.std(props, axis=1)
+            new_features[f'Range_Property{prop}'] = np.max(props, axis=1) - np.min(props, axis=1)
+            new_features[f'Max_Property{prop}'] = np.max(props, axis=1)
+            new_features[f'Min_Property{prop}'] = np.min(props, axis=1)
+        
+        # 2. Enhanced interaction features
+        for i in range(1, 6):
+            for j in range(i+1, 6):
+                frac_i = f'Component{i}_fraction'
+                frac_j = f'Component{j}_fraction'
+                new_features[f'Frac_Interaction_{i}_{j}'] = X[frac_i] * X[frac_j]
+                
+                for prop in self.important_props:
+                    prop_i = f'Component{i}_Property{prop}'
+                    prop_j = f'Component{j}_Property{prop}'
+                    new_features[f'Prop_Interaction_{prop}_{i}_{j}'] = X[prop_i] * X[prop_j]
+                    new_features[f'Prop_Diff_{prop}_{i}_{j}'] = X[prop_i] - X[prop_j]
+        
+        # 3. Polynomial and non-linear features
+        for prop in self.important_props:
+            weighted = new_features[f'WeightedAvg_Property{prop}']
+            new_features[f'Property{prop}_squared'] = weighted ** 2
+            new_features[f'Property{prop}_sqrt'] = np.sqrt(np.abs(weighted))
+            new_features[f'Property{prop}_log'] = np.log1p(np.abs(weighted))
+            new_features[f'Property{prop}_reciprocal'] = 1 / (1 + np.abs(weighted))
+        
+        # 4. Composition features
+        total_fractions = sum(X[f'{comp}_fraction'] for comp in components)
+        for comp in components:
+            new_features[f'{comp}_dominance'] = X[f'{comp}_fraction'] / (total_fractions + 1e-6)
+        
+        # Combine all features efficiently
+        new_features_df = pd.DataFrame(new_features)
+        return pd.concat([X, new_features_df], axis=1)
+
+# Load data
+train_data = pd.read_csv('dataset/train.csv')
+test_data = pd.read_csv('dataset/test.csv')
+
+# Separate features and targets
+X = train_data.drop(columns=[f'BlendProperty{i}' for i in range(1, 11)])
+y = train_data[[f'BlendProperty{i}' for i in range(1, 11)]]
+
+# Enhanced data splitting with KFold
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+splits = list(kf.split(X))
+
+# Advanced preprocessing
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler()),
+    ('transformer', PowerTransformer(method='yeo-johnson'))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numeric_transformer, X.columns)
+    ])
+
+# Enhanced base models
+def get_base_models():
+    return [
+        ('xgb', XGBRegressor(
+            n_estimators=1000,
+            max_depth=6,
+            learning_rate=0.02,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            gamma=0.1,
+            random_state=42,
+            n_jobs=-1
+        )),
+        ('lgbm', LGBMRegressor(
+            n_estimators=1000,
+            max_depth=7,
+            learning_rate=0.02,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=42,
+            n_jobs=-1
+        )),
+        ('catboost', CatBoostRegressor(
+            iterations=800,
+            depth=6,
+            learning_rate=0.03,
+            l2_leaf_reg=3,
+            random_seed=42,
+            silent=True,
+            thread_count=-1
+        )),
+        ('kernel_ridge', KernelRidge(
+            alpha=0.5,
+            kernel='polynomial',
+            degree=2
+        )),
+        ('elasticnet', ElasticNet(
+            alpha=0.001,
+            l1_ratio=0.7,
+            random_state=42,
+            max_iter=2000
+        ))
+    ]
+
+# Meta-models
+def get_meta_models():
+    return [
+        ('ridge', Ridge(alpha=1.0)),
+        ('lasso', Lasso(alpha=0.001)),
+        ('svr', SVR(C=5, kernel='rbf'))
+    ]
+
+# Enhanced stacking approach
+def create_enhanced_stacker():
+    base_models = get_base_models()
+    meta_models = get_meta_models()
     
-    # 1. Weighted Averages of Component Properties
-    for prop_num in range(1, 11):
-        weighted_avg_col = f'BlendProperty{prop_num}_WeightedAvg'
-        df_features[weighted_avg_col] = 0.0
-        for comp_num in range(1, 6):
-            vol_col = f'Component{comp_num}_vol'
-            prop_col = f'Component{comp_num}_Property{prop_num}'
-            if vol_col in df_processed.columns and prop_col in df_processed.columns:
-                df_features[weighted_avg_col] += (df_processed[vol_col] / 100.0) * df_processed[prop_col]
+    # Create multiple stacking layers
+    level1 = StackingRegressor(
+        estimators=base_models,
+        final_estimator=Ridge(alpha=1.0),
+        cv=5,
+        n_jobs=-1
+    )
     
-    # 2. Polynomial Interactions (Volume x Property, squared terms)
-    for comp_num in range(1, 6):
-        vol_col = f'Component{comp_num}_vol'
-        for prop_num in range(1, 11):
-            prop_col = f'Component{comp_num}_Property{prop_num}'
-            if vol_col in df_processed.columns and prop_col in df_processed.columns:
-                df_features[f'{vol_col}_x_{prop_col}'] = df_processed[vol_col] * df_processed[prop_col]
-                df_features[f'{prop_col}_squared'] = df_processed[prop_col] ** 2
+    level2 = StackingRegressor(
+        estimators=meta_models,
+        final_estimator=VotingRegressor([
+            ('ridge', Ridge(alpha=0.5)),
+            ('lgbm', LGBMRegressor(n_estimators=200))
+        ]),
+        cv=3,
+        n_jobs=-1
+    )
     
-    # 3. Statistical Aggregations
-    for prop_num in range(1, 11):
-        props_for_agg = [f'Component{comp_num}_Property{prop_num}' for comp_num in range(1, 6)]
-        existing_props_for_agg = [p for p in props_for_agg if p in df_processed.columns]
-        if existing_props_for_agg:
-            df_features[f'Property{prop_num}_min'] = df_processed[existing_props_for_agg].min(axis=1)
-            df_features[f'Property{prop_num}_max'] = df_processed[existing_props_for_agg].max(axis=1)
-            df_features[f'Property{prop_num}_mean'] = df_processed[existing_props_for_agg].mean(axis=1)
-            df_features[f'Property{prop_num}_std'] = df_processed[existing_props_for_agg].std(axis=1).fillna(0)
-            df_features[f'Property{prop_num}_range'] = df_features[f'Property{prop_num}_max'] - df_features[f'Property{prop_num}_min']
+    return Pipeline([
+        ('feature', AdvancedFeatureEngineer()),
+        ('preprocess', preprocessor),
+        ('feature_select', SelectFromModel(LGBMRegressor(), threshold='1.25*median')),
+        ('pca', PCA(n_components=0.95)),
+        ('regressor', level2)
+    ])
+
+# Train and predict for each property
+models = {}
+for prop in range(1, 11):
+    print(f"\n=== Training BlendProperty{prop} ===")
     
-    # 4. Property Ratios Between Components
-    for prop_num in range(1, 11):
-        for comp_num1 in range(1, 5):
-            for comp_num2 in range(comp_num1 + 1, 6):
-                prop_col1 = f'Component{comp_num1}_Property{prop_num}'
-                prop_col2 = f'Component{comp_num2}_Property{prop_num}'
-                if prop_col1 in df_processed.columns and prop_col2 in df_processed.columns:
-                    df_features[f'Prop{prop_num}_Comp{comp_num1}_div_Comp{comp_num2}'] = df_processed[prop_col1] / (df_processed[prop_col2] + 1e-6)
+    # Create enhanced model
+    model = create_enhanced_stacker()
     
-    # 5. Log Transformations for Skewed Properties
-    for prop_num in range(1, 11):
-        props_for_agg = [f'Component{comp_num}_Property{prop_num}' for comp_num in range(1, 6)]
-        existing_props_for_agg = [p for p in props_for_agg if p in df_processed.columns]
-        for col in existing_props_for_agg:
-            df_features[f'{col}_log'] = np.log1p(df_processed[col].clip(lower=0))
+    # Cross-validation
+    fold_scores = []
+    for fold, (train_idx, val_idx) in enumerate(splits):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx][f'BlendProperty{prop}'], y.iloc[val_idx][f'BlendProperty{prop}']
+        
+        model.fit(X_train, y_train)
+        val_pred = model.predict(X_val)
+        mape = mean_absolute_percentage_error(y_val, val_pred)
+        fold_scores.append(mape)
+        print(f"Fold {fold+1} MAPE: {mape:.4f}")
     
-    return df_features
-
-# Apply feature engineering
-print("\nPerforming Feature Engineering...")
-X_train_fe = create_features(train_df, is_train_df=True)
-X_test_fe = create_features(test_df, is_train_df=False)
-
-# Align columns
-train_cols = X_train_fe.columns
-test_cols = X_test_fe.columns
-missing_in_test = set(train_cols) - set(test_cols)
-for c in missing_in_test:
-    X_test_fe[c] = 0
-missing_in_train = set(test_cols) - set(train_cols)
-for c in missing_in_train:
-    X_train_fe[c] = 0
-X_test_fe = X_test_fe[train_cols]
-
-# Preprocessing: Standardize features
-scaler = StandardScaler()
-X_train_fe = pd.DataFrame(scaler.fit_transform(X_train_fe), columns=X_train_fe.columns, index=X_train_fe.index)
-X_test_fe = pd.DataFrame(scaler.transform(X_test_fe), columns=X_test_fe.columns, index=X_test_fe.index)
-
-y_train = train_df[target_columns]
-
-print("Features after engineering (X_train_fe) shape:", X_train_fe.shape)
-print("Features after engineering (X_test_fe) shape:", X_test_fe.shape)
-
-# --- 4. Hyperparameter Tuning with Optuna ---
-def objective(trial):
-    lgb_params = {
-        'objective': 'regression_l1',
-        'metric': 'mae',
-        'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
-        'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
-        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
-        'bagging_freq': 1,
-        'lambda_l1': trial.suggest_float('lambda_l1', 0.0, 10.0),
-        'lambda_l2': trial.suggest_float('lambda_l2', 0.0, 10.0),
-        'num_leaves': trial.suggest_int('num_leaves', 31, 128),
-        'verbose': -1,
-        'n_jobs': -1,
-        'seed': 42
-    }
-    model = MultiOutputRegressor(lgb.LGBMRegressor(**lgb_params))
-    kf = KFold(n_splits=3, shuffle=True, random_state=42)
-    mape_scores = []
-    for train_idx, val_idx in kf.split(X_train_fe):
-        X_tr, X_val = X_train_fe.iloc[train_idx], X_train_fe.iloc[val_idx]
-        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-        model.fit(X_tr, y_tr)
-        val_preds = model.predict(X_val)
-        mape = np.mean([mean_absolute_percentage_error(y_val[col], val_preds[:, i]) for i, col in enumerate(target_columns)])
-        mape_scores.append(mape)
-    return np.mean(mape_scores)
-
-print("\nRunning Optuna for hyperparameter tuning...")
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=20)
-best_params = study.best_params
-print("Best hyperparameters:", best_params)
-
-# --- 5. Model Training ---
-lgb_params = {
-    'objective': 'regression_l1',
-    'metric': 'mae',
-    'n_estimators': best_params['n_estimators'],
-    'learning_rate': best_params['learning_rate'],
-    'feature_fraction': best_params['feature_fraction'],
-    'bagging_fraction': best_params['bagging_fraction'],
-    'bagging_freq': 1,
-    'lambda_l1': best_params['lambda_l1'],
-    'lambda_l2': best_params['lambda_l2'],
-    'num_leaves': best_params['num_leaves'],
-    'verbose': -1,
-    'n_jobs': -1,
-    'seed': 42
-}
-xgb_params = {
-    'objective': 'reg:absoluteerror',
-    'n_estimators': 1000,
-    'learning_rate': 0.01,
-    'max_depth': 6,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'reg_lambda': 1.0,
-    'reg_alpha': 0.1,
-    'random_state': 42,
-    'n_jobs': -1
-}
-
-# Train LightGBM and XGBoost
-lgb_model = MultiOutputRegressor(lgb.LGBMRegressor(**lgb_params))
-xgb_model = MultiOutputRegressor(xgb.XGBRegressor(**xgb_params))
-
-print("\nStarting K-Fold Cross-Validation training...")
-kf = KFold(n_splits=7, shuffle=True, random_state=42)  # Increased to 7 folds
-oof_preds_lgb = np.zeros(y_train.shape)
-oof_preds_xgb = np.zeros(y_train.shape)
-test_preds_lgb = []
-test_preds_xgb = []
-fold_mape_scores = []
-
-for fold, (train_index, val_index) in enumerate(kf.split(X_train_fe, y_train)):
-    print(f"--- Fold {fold + 1}/{kf.n_splits} ---")
-    X_train_fold, X_val_fold = X_train_fe.iloc[train_index], X_train_fe.iloc[val_index]
-    y_train_fold, y_val_fold = y_train.iloc[train_index], y_train.iloc[val_index]
+    print(f"Average MAPE: {np.mean(fold_scores):.4f} ± {np.std(fold_scores):.4f}")
     
-    # Train LightGBM
-    lgb_model.fit(X_train_fold, y_train_fold)
-    lgb_val_preds = lgb_model.predict(X_val_fold)
-    oof_preds_lgb[val_index] = lgb_val_preds
-    test_preds_lgb.append(lgb_model.predict(X_test_fe))
-    
-    # Train XGBoost
-    xgb_model.fit(X_train_fold, y_train_fold)
-    xgb_val_preds = xgb_model.predict(X_val_fold)
-    oof_preds_xgb[val_index] = xgb_val_preds
-    test_preds_xgb.append(xgb_model.predict(X_test_fe))
-    
-    # Blend predictions (weighted average, 0.7 LGB + 0.3 XGB)
-    blend_val_preds = 0.7 * lgb_val_preds + 0.3 * xgb_val_preds
-    fold_mape = np.mean([mean_absolute_percentage_error(y_val_fold[col], blend_val_preds[:, i]) for i, col in enumerate(target_columns)])
-    fold_mape_scores.append(fold_mape)
-    print(f"Fold {fold + 1} Average MAPE: {fold_mape:.4f}")
+    # Full training
+    model.fit(X, y[f'BlendProperty{prop}'])
+    models[f'BlendProperty{prop}'] = model
 
-print("\nCross-Validation Complete.")
-print("Per-fold Average MAPEs:", [f"{m:.4f}" for m in fold_mape_scores])
-overall_cv_mape = np.mean(fold_mape_scores)
-print(f"Overall Cross-Validation Average MAPE: {overall_cv_mape:.4f}")
+# Generate predictions
+predictions = pd.DataFrame({'ID': test_data['ID']})
+for prop in range(1, 11):
+    predictions[f'BlendProperty{prop}'] = models[f'BlendProperty{prop}'].predict(test_data.drop(columns=['ID']))
 
-# --- 6. Final Predictions and Submission ---
-final_test_predictions_lgb = np.mean(test_preds_lgb, axis=0)
-final_test_predictions_xgb = np.mean(test_preds_xgb, axis=0)
-final_test_predictions = 0.7 * final_test_predictions_lgb + 0.3 * final_test_predictions_xgb
-
-predictions_df = pd.DataFrame(final_test_predictions, columns=target_columns)
-submission_df = pd.DataFrame({'ID': test_ids})
-submission_df = pd.concat([submission_df, predictions_df], axis=1)
-submission_df = submission_df[['ID'] + target_columns]
-
-submission_file_name = 'submission_improved.csv'
-submission_df.to_csv(submission_file_name, index=False)
-
-print(f"\nSubmission file '{submission_file_name}' created successfully!")
-print("First 5 rows of the submission file:")
-print(submission_df.head())
-
-# Estimate leaderboard score
-reference_cost_public = 2.72
-estimated_score_public = 100 * max(0, 1 - overall_cv_mape / reference_cost_public)
-print(f"\nEstimated Public Leaderboard Score: {estimated_score_public:.2f}")
+# Save submission
+predictions.to_csv('enhanced_submission.csv', index=False)
+print("\nEnhanced submission saved!")
